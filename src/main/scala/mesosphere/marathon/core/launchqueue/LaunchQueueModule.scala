@@ -76,7 +76,7 @@ class LaunchQueueModule(
   val launchStats = LaunchStats(
     groupManager,
     clock,
-    instanceTracker.instanceUpdates,
+    instanceTracker,
     rateLimiterUpdates,
     offerMatchStatistics)
 }

@@ -3,18 +3,19 @@ package core.launchqueue
 
 import akka.NotUsed
 import akka.stream.Materializer
-import akka.stream.scaladsl.{ Keep, Sink, Source }
+import akka.stream.scaladsl.{Keep, Sink, Source}
 import com.typesafe.scalalogging.StrictLogging
 import java.time.Clock
+
 import mesosphere.marathon.core.group.GroupManager
-import mesosphere.marathon.core.instance.Instance
-import mesosphere.marathon.core.instance.update.{ InstanceChange, InstanceUpdated }
 import mesosphere.marathon.core.launcher.OfferMatchResult
 import mesosphere.marathon.core.launchqueue.impl.OfferMatchStatistics.RunSpecOfferStatistics
 import mesosphere.marathon.core.launchqueue.impl.{OfferMatchStatistics, RateLimiter}
-import mesosphere.marathon.state.{ PathId, RunSpec, RunSpecConfigRef, Timestamp }
+import mesosphere.marathon.core.task.tracker.InstanceTracker
+import mesosphere.marathon.state.{PathId, RunSpec, RunSpecConfigRef, Timestamp}
 import mesosphere.marathon.stream.{EnrichedSink, LiveFold}
-import mesosphere.mesos.{NoOfferMatchReason}
+import mesosphere.mesos.NoOfferMatchReason
+
 import scala.concurrent.{ExecutionContext, Future}
 import scala.async.Async._
 
@@ -24,7 +25,7 @@ import scala.async.Async._
 class LaunchStats private [launchqueue] (
     getRunSpec: PathId => Option[RunSpec],
     delays: LiveFold.Folder[Map[RunSpecConfigRef, Timestamp]],
-    launchingInstances: LiveFold.Folder[Map[Instance.Id, LaunchStats.LaunchingInstance]],
+    instanceTracker: InstanceTracker,
     runSpecStatistics: LiveFold.Folder[Map[PathId, RunSpecOfferStatistics]],
     noMatchStatistics: LiveFold.Folder[Map[PathId, Map[String, OfferMatchResult.NoMatch]]])(implicit ec: ExecutionContext) {
 
@@ -33,12 +34,13 @@ class LaunchStats private [launchqueue] (
       * Quick sanity check. These streams should run for the duration of Marathon. In the off chance they aren't, make
       * it obvious.
       */
-    require(!launchingInstances.finalResult.isCompleted, s"Launching Instances should not be completed; ${launchingInstances.finalResult}")
     require(!runSpecStatistics.finalResult.isCompleted, s"RunSpecStatistics should not be completed; ${runSpecStatistics.finalResult}")
     require(!noMatchStatistics.finalResult.isCompleted, s"NoMatchStatistics should not be completed, ${noMatchStatistics.finalResult}")
     require(!delays.finalResult.isCompleted, s"Delays should not be completed; ${delays.finalResult}")
 
-    val launchingInstancesByRunSpec = await(launchingInstances.readCurrentResult()).values.groupBy { _.instance.runSpecId }
+    val launchingInstancesByRunSpec = await(instanceTracker.instancesBySpec()).allInstances
+      .filter { instance => instance.isScheduled || instance.isProvisioned }
+      .groupBy(_.instance.runSpecId)
     val currentDelays = await(delays.readCurrentResult())
     val lastNoMatches = await(noMatchStatistics.readCurrentResult())
     val currentRunSpecStatistics = await(runSpecStatistics.readCurrentResult())
@@ -49,7 +51,7 @@ class LaunchStats private [launchqueue] (
     } yield {
       val lastOffers: Seq[OfferMatchResult.NoMatch] = lastNoMatches.get(path).map(_.values.toVector).getOrElse(Nil)
       val statistics = currentRunSpecStatistics.getOrElse(path, RunSpecOfferStatistics.empty)
-      val startedAt = if (instances.nonEmpty) instances.iterator.map(_.since).min else Timestamp.now()
+      val startedAt = if (instances.nonEmpty) instances.iterator.map(_.state.since).min else Timestamp.now()
 
       LaunchStats.QueuedInstanceInfoWithStatistics(
         runSpec = runSpec,
@@ -87,32 +89,13 @@ object LaunchStats extends StrictLogging {
     }
   })
 
-  private [launchqueue] case class LaunchingInstance(since: Timestamp, instance: Instance)
-
-  /**
-    * Current known list of active instances
-    */
-  private [launchqueue] val launchingInstancesFold:
-      Sink[(Timestamp, InstanceChange), LiveFold.Folder[Map[Instance.Id, LaunchStats.LaunchingInstance]]] =
-    EnrichedSink.liveFold(Map.empty[Instance.Id, LaunchingInstance])({ case (instances, (timestamp, change)) =>
-      change match {
-        case InstanceUpdated(newInstance, _, _) if newInstance.isScheduled || newInstance.isProvisioned =>
-          val newRecord = instances.get(change.id)
-            .map { launchingInstance => launchingInstance.copy(instance = newInstance) }
-            .getOrElse { LaunchingInstance(timestamp, newInstance) }
-          instances + (change.id -> newRecord)
-        case _ =>
-          instances - (change.id)
-      }
-    })
-
   /**
     * Given a source of instance updates, delay updates, and offer match statistics updates, materialize the streams and
     * aggregate the resulting data to produce the data returned by /v2/queue
     *
     * @param groupManager
     * @param clock
-    * @param instanceUpdates InstanceTracker state subscription stream.
+    * @param instanceTracker InstanceTracker
     * @param delayUpdates RateLimiter state subscription stream.
     * @param offerMatchUpdates Series of OfferMatchStatistic updates, as emitted by TaskLauncherActor
     *
@@ -121,21 +104,19 @@ object LaunchStats extends StrictLogging {
   def apply(
     groupManager: GroupManager,
     clock: Clock,
-    instanceUpdates: Source[InstanceChange, NotUsed],
+    instanceTracker: InstanceTracker,
     delayUpdates: Source[RateLimiter.DelayUpdate, NotUsed],
     offerMatchUpdates: Source[OfferMatchStatistics.OfferMatchUpdate, NotUsed],
   )(implicit mat: Materializer, ec: ExecutionContext): LaunchStats = {
 
     val delays = delayUpdates.runWith(delayFold)
 
-    val launchingInstances = instanceUpdates.map { i => (clock.now(), i) }.runWith(launchingInstancesFold)
-
     val (runSpecStatistics, noMatchStatistics) =
       offerMatchUpdates
         .alsoToMat(OfferMatchStatistics.runSpecStatisticsSink)(Keep.right)
         .toMat(OfferMatchStatistics.noMatchStatisticsSink)(Keep.both)
         .run
-    new LaunchStats(groupManager.runSpec(_), delays, launchingInstances, runSpecStatistics, noMatchStatistics)
+    new LaunchStats(groupManager.runSpec(_), delays, instanceTracker, runSpecStatistics, noMatchStatistics)
   }
 
   /**

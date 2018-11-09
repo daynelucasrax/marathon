@@ -1,23 +1,23 @@
 package mesosphere.marathon
 package core.launchqueue
 
-import akka.stream.scaladsl.Source
 import mesosphere.AkkaUnitTest
 import mesosphere.marathon.core.condition.Condition
-import mesosphere.marathon.core.instance.update.{InstanceChange, InstanceUpdated}
 import mesosphere.marathon.core.launcher.InstanceOp
 import mesosphere.marathon.core.launcher.OfferMatchResult
 import mesosphere.marathon.core.launchqueue.impl.OfferMatchStatistics.MatchResult
 import mesosphere.marathon.core.launchqueue.impl.OfferMatchStatistics
-import mesosphere.marathon.state.{ PathId, RunSpec, Timestamp }
+import mesosphere.marathon.core.task.tracker.InstanceTracker
+import mesosphere.marathon.core.task.tracker.InstanceTracker.InstancesBySpec
+import mesosphere.marathon.state.{PathId, RunSpec, Timestamp}
 import mesosphere.marathon.stream.LiveFold
 import mesosphere.marathon.test.MarathonTestHelper
 import org.apache.mesos.{Protos => Mesos}
+
 import scala.concurrent.Future
 import scala.concurrent.duration._
 
 class LaunchStatsTest extends AkkaUnitTest {
-  import LaunchStats.LaunchingInstance
 
   class Fixture {
     val runSpecA = MarathonTestHelper.makeBasicApp(id = PathId("/a"))
@@ -33,38 +33,14 @@ class LaunchStatsTest extends AkkaUnitTest {
     // instance related stuff
     val instance = MarathonTestHelper.makeProvisionedInstance(runSpecA.id)
     val instanceId = instance.instanceId
-    val scheduled = instance.copy(state = instance.state.copy(condition = Condition.Scheduled))
-    val provisioned = instance.copy(state = instance.state.copy(condition = Condition.Provisioned))
-    val running = instance.copy(state = instance.state.copy(condition = Condition.Running))
+    val scheduled = instance.copy(state = instance.state.copy(condition = Condition.Scheduled, since = ts1))
     val ts1 = Timestamp.zero
     val ts2 = ts1 + 1.minute
     val ts3 = ts1 + 2.minutes
 
+    val instanceTracker = mock[InstanceTracker]
+
     val runSpecs: Map[PathId, RunSpec] = Seq(runSpecA).map { r => r.id -> r }.toMap
-  }
-
-  "launchingInstancesFold" should {
-    "keeps track of the first time the instance was reported as scheduled or provisioned" in new Fixture {
-      val fold = Source(List[(Timestamp, InstanceChange)](
-        ts1 -> InstanceUpdated(scheduled, None, Nil),
-        ts2 -> InstanceUpdated(provisioned, None, Nil)))
-        .runWith(LaunchStats.launchingInstancesFold)
-
-      val result = fold.finalResult.futureValue
-      result(instance.instanceId).since shouldBe ts1
-      result(instance.instanceId).instance shouldBe provisioned
-    }
-
-    "clears instances from the map when they are neither scheduled or provisioned" in new Fixture {
-      val fold = Source(List[(Timestamp, InstanceChange)](
-        ts1 -> InstanceUpdated(scheduled, None, Nil),
-        ts2 -> InstanceUpdated(provisioned, None, Nil),
-        ts3 -> InstanceUpdated(running, None, Nil)))
-        .runWith(LaunchStats.launchingInstancesFold)
-
-      val result = fold.finalResult.futureValue
-      result.shouldBe(empty)
-    }
   }
 
   case class FoldFixture[T](result: T) extends LiveFold.Folder[T] {
@@ -73,12 +49,12 @@ class LaunchStatsTest extends AkkaUnitTest {
   }
 
   "offer stats still shows a delay even though there are no offer stats" in new Fixture {
+    instanceTracker.instancesBySpec() returns Future.successful(InstancesBySpec.forInstances(Seq(scheduled)))
+
     val stats = new LaunchStats(
       getRunSpec = runSpecs.get(_),
       delays = FoldFixture(Map(runSpecA.configRef -> ts2)),
-      launchingInstances = FoldFixture(Map(
-        instanceId -> LaunchingInstance(ts1, scheduled),
-      )),
+      instanceTracker = instanceTracker,
       runSpecStatistics = FoldFixture(Map.empty),
       noMatchStatistics = FoldFixture(Map.empty))
 
@@ -87,12 +63,12 @@ class LaunchStatsTest extends AkkaUnitTest {
   }
 
   "shows runSpecStatistics" in new Fixture {
+    instanceTracker.instancesBySpec() returns Future.successful(InstancesBySpec.forInstances(Seq(scheduled)))
+
     val stats = new LaunchStats(
       getRunSpec = runSpecs.get(_),
       delays = FoldFixture(Map.empty),
-      launchingInstances = FoldFixture(Map(
-        instanceId -> LaunchingInstance(ts1, scheduled),
-      )),
+      instanceTracker = instanceTracker,
       runSpecStatistics = FoldFixture(Map(
         runSpecA.id -> OfferMatchStatistics.RunSpecOfferStatistics.apply(
           rejectSummary = Map(),
